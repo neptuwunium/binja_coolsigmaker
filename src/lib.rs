@@ -18,8 +18,8 @@
 //! along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //!
 
-#![feature(let_chains, iter_array_chunks)]
-use std::borrow::Cow;
+#![feature(iter_array_chunks)]
+use std::{borrow::Cow, sync::atomic::Ordering};
 
 use std::fmt::Display;
 use std::ops::Range;
@@ -27,12 +27,12 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use std::time::SystemTime;
 
-use binary_search::{binary_search, Direction};
-use binaryninja::settings::Settings;
+use binary_search::{Direction, binary_search};
 use binaryninja::{
     architecture::Architecture,
     binary_view::{BinaryView, BinaryViewBase, BinaryViewExt},
     command::{self, AddressCommand, Command},
+    settings::Settings,
 };
 
 use clipboard::ClipboardProvider;
@@ -41,8 +41,7 @@ use iced_x86::{
     Code::{DeclareByte, DeclareDword, DeclareQword, DeclareWord},
     ConstantOffsets, FlowControl, Formatter, Instruction, NasmFormatter, OpKind,
 };
-use rayon::prelude::ParallelBridge;
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
 use strum::{Display, EnumIter, EnumMessage, EnumString, IntoEnumIterator, VariantNames};
 
 type OwnedPattern = Vec<Option<u8>>;
@@ -71,7 +70,9 @@ struct SigFinderCommand;
 
 #[derive(thiserror::Error, Debug)]
 enum SignatureError {
-    #[error("pattern is not unique even at size of {0} bytes! we either hit the limit or would have broken a function boundary.")]
+    #[error(
+        "pattern is not unique even at size of {0} bytes! we either hit the limit or would have broken a function boundary."
+    )]
     NotUnique(u64),
     #[error("encountered an invalid instruction")]
     InvalidInstruction,
@@ -240,12 +241,14 @@ trait FromSignature {
                             .map(|_| None)
                             .collect::<Vec<Option<u8>>>();
 
-                        let mut result = vec![u8::from_str_radix(&byte, 16)
-                            .map_err(|x| {
-                                log::error!("unable to parse pattern!");
-                                x
-                            })
-                            .ok()];
+                        let mut result = vec![
+                            u8::from_str_radix(&byte, 16)
+                                .map_err(|x| {
+                                    log::error!("unable to parse pattern!");
+                                    x
+                                })
+                                .ok(),
+                        ];
 
                         result.extend(wildcards);
 
@@ -436,10 +439,11 @@ fn is_pattern_unique(code_segments: &[(u64, Vec<u8>)], pattern: Pattern) -> bool
     let count = AtomicUsize::new(0);
 
     iter.find_any(|_| {
-        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        count.load(std::sync::atomic::Ordering::Relaxed) > 1
-    })
-    .is_none()
+        count.fetch_add(1, Ordering::Relaxed);
+        count.load(Ordering::Relaxed) > 1
+    });
+
+    count.load(Ordering::Relaxed) == 1
 }
 
 fn create_pattern_internal_binarysearch(
@@ -850,9 +854,23 @@ fn register_settings() {
 
     settings.register_group("coolsigmaker", "CoolSigMaker");
 
-    register_setting::<bool>(&settings, "coolsigmaker.include_operands", "Include Operands", "Include immediate operands that aren't memory-relative or relocated when creating signatures. This results in smaller, but potentially more fragile, signatures. If no unique signature can be generated without operands, we fall back to including them.", "boolean", false);
+    register_setting::<bool>(
+        &settings,
+        "coolsigmaker.include_operands",
+        "Include Operands",
+        "Include immediate operands that aren't memory-relative or relocated when creating signatures. This results in smaller, but potentially more fragile, signatures. If no unique signature can be generated without operands, we fall back to including them.",
+        "boolean",
+        false,
+    );
 
-    register_setting::<bool>(&settings, "coolsigmaker.binary_search", "Use Binary Search", "Use a binary search to determine instruction uniqueness. For small binaries, this will be slower than the default, while for bigger binaries it might be faster. It starts scanning at half the maximum signature size. There is no heuristic implemented to automatically determine this yet.", "boolean", false);
+    register_setting::<bool>(
+        &settings,
+        "coolsigmaker.binary_search",
+        "Use Binary Search",
+        "Use a binary search to determine instruction uniqueness. For small binaries, this will be slower than the default, while for bigger binaries it might be faster. It starts scanning at half the maximum signature size. There is no heuristic implemented to automatically determine this yet.",
+        "boolean",
+        false,
+    );
 
     register_setting::<u64>(
         &settings,
@@ -958,7 +976,7 @@ impl Command for SigFinderCommand {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn CorePluginInit() -> bool {
     // Due to a breaking change in binaryninja-api, you will need to edit this line depending on which version you are building for.
 
